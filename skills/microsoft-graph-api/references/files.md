@@ -86,13 +86,41 @@ GET {drive}/items/{itemId}/content
 
 レスポンスはJSONではなく**ファイルの生バイト列**（`Content-Type` は元ファイルのMIMEタイプ）。多くのHTTPクライアントではJSONパースを介さず直接バイナリとして受け取って保存する。
 
-**boidゲートウェイ経由の場合、このエンドポイントは`-L`を付けても実質的にダウンロードできない可能性が高い。** 直接呼び出しであれば、Graphはこのエンドポイントに対して一時的な署名付きURL（SharePoint/Azure Blob Storage等、Graphとは別ホスト）へ**302リダイレクト**することが多く、クライアント側はそれをそのまま追従すればよい。しかしboidゲートウェイ経由の場合は事情が異なる:
+**このエンドポイントはboidゲートウェイ経由では「そのままでは」動かない。ワークスペースの `allowed_domains` にリダイレクト先ホストを追加する事前設定が必要。** 直接呼び出しであれば、Graphはこのエンドポイントに対して事前認証済み（pre-authenticated）の一時URL（SharePoint/OneDrive側、Graphとは別ホスト）へ**302リダイレクト**し、クライアントはそれを追従すればよい。boidゲートウェイ経由の場合、この経路上に2つの制約が重なる:
 
-- boidゲートウェイの実装（`internal/apigateway`）は素の `net/http/httputil.ReverseProxy` を使っており、**リダイレクトを自動フォローせず、302レスポンスとその生の `Location` ヘッダー（`$BOID_API_BASE` 配下ではない、Graph/Azure側の外部絶対URL）をそのままサンドボックスへ転送する**
-- boidサンドボックスのネットワーク送信は**許可リスト方式**（`config.yaml` の `sandbox.allowed_domains`。既定はAnthropic/OpenAI APIや各言語パッケージレジストリなど）で制御されており、外向き通信は原則ゲートウェイ経由に限定される設計になっている。SharePoint/Azure Blob側のダウンロードホストは既定の許可リストに含まれておらず、`Location` を素直に追従しても大抵はサンドボックスの送信制限にブロックされて失敗する
-- 例外的に、そのホストが運用者によって `sandbox.allowed_domains` に明示的に追加されていれば直接到達できる可能性はある（署名付きURL自体に認証情報が埋め込まれているため、`Authorization` ヘッダーなしでもURLを知っていれば取得できる設計）。ただしダウンロード先ホストはリクエストごと・テナントごとに変わりうるため、事前の恒久的な許可リスト登録が難しいケースが多い
+- boidゲートウェイの実装（`internal/apigateway/server.go`）は素の `net/http/httputil.ReverseProxy` を使っており、**リダイレクトを自動フォローせず、302レスポンスとその生の `Location` ヘッダー（`$BOID_API_BASE` 配下ではない外部絶対URL）をそのままサンドボックスへ転送する**（`ModifyResponse` も `Location` を書き換えない）
+- boidサンドボックスのネットワーク送信は**許可リスト方式**（`internal/sandbox/proxy.go` の `isDomainAllowed`）で制御されており、既定の許可リスト（Anthropic/OpenAI APIや各言語パッケージレジストリなど）にSharePoint/OneDriveのダウンロードホストは含まれない。この状態で `-L` を付けて追従すると、サンドボックスのegressプロキシがCONNECTを弾き `403 domain not allowed` になる
 
-つまり、boidジョブ内から大きめのファイルを確実にダウンロードしたい場合、この `.../content` エンドポイントへの単純な `GET`（+リダイレクト追従）に依存する設計は避けるべきで、実際にこの操作が必要な場合は運用者に「このジョブ向けにファイルダウンロード用の許可リスト設定が入っているか」を確認することを推奨する。`ms-graph-cli` の `files get`（ローカルCLI経由、boidサンドボックス外での実行が前提）は素のGoの `http.Client`（既定でリダイレクトを追従する）を使っているため、この制約を受けない点にも注意（CLI実行環境とboidジョブ実行環境で挙動が異なる）。
+### 対処: ワークスペーススコープでリダイレクト先ホストを許可する
+
+`allowed_domains` は**グローバルの `sandbox.allowed_domains`（フロア）とワークスペースごとの `allowed_domains` の加算的な和**として解決される（boid `internal/orchestrator/workspace_meta.go` の `ResolveAllowedDomains`）。したがってグローバルに穴を開ける必要はなく、**Graphを使うワークスペースにだけ、そのテナントの具体ホストを追加すればよい**。
+
+```yaml
+# ワークスペースのメタデータ（グローバルの config.yaml ではない）
+allowed_domains:
+  - urbanb.sharepoint.com      # /sites/{id}/drive のドキュメントライブラリ
+  - urbanb-my.sharepoint.com   # /me/drive（OneDrive for Business の個人ドライブ）
+```
+
+- **ホスト指定は先頭ドットの有無で意味が変わる。** `isDomainAllowed` は先頭が `.` なら接尾辞マッチ（`.sharepoint.com` は全サブドメインを許可）、そうでなければ**完全一致**。穴を最小化するため、`.sharepoint.com` のようなワイルドカードではなく具体的なテナントホストを完全一致で書くこと
+- **`-my` 付きホストは別ホスト。** `/me/drive`（OneDrive for Business の個人ドライブ）のリダイレクト先は `<tenant>-my.sharepoint.com`、`/sites/{id}/drive` は `<tenant>.sharepoint.com` になる。使う側に応じて両方登録する
+- **実際の `Location` を一度観測してから確定すること。** `format=pdf` 等の変換系や一部のメディア配信は `*.svc.ms`（`westeurope1.mediap.svc.ms` 等）に、個人用MSAアカウントのOneDriveは `*.files.1drv.com` に飛ぶ。ジョブ内で `-L` を付けずに `curl -i` を一度叩き、返ってきた `Location` のホストを確認するのが確実
+
+### リダイレクト先に `Authorization` を送ってはいけない
+
+リダイレクト先URLは**事前認証済み**で、トークンがURL自体（SPOなら `download.aspx?...&tempauth=<token>`、OneDriveなら `files.1drv.com/<opaque-token>`）に埋め込まれている。公式ドキュメントも「You don't need to include an `Authorization` header when you access the download URL」と明記しており、サンドボックスが資格情報を持たないままでも200が返る。
+
+むしろ**`Authorization` ヘッダーを転送すると SharePoint 側が401を返す**という既知の罠がある（msgraph-sdk-dotnet issue #3057）。boid経由ではサンドボックスのcurlはそもそも `Authorization` を持たず（注入するのはゲートウェイ側）、curlも既定でクロスホストのリダイレクト時に認証ヘッダーを落とす（`--location-trusted` を付けない限り）ため、通常この罠は踏まない。自前のHTTPクライアントで追従処理を書く場合のみ注意すること。
+
+### 失効が早い
+
+事前認証済みURLは**数分で失効する**（公式ドキュメント: "they might expire within minutes"）。302を受け取ってから追従までを別プロセス・別ステップに分割するとタイムアウトしうるので、本番のダウンロードは `-L` で即座に追従する形にすること（`Location` の分割観測はデバッグ時のみ）。
+
+### 補足
+
+- **メール添付ファイルはこの問題の影響を受けない。** `GET /me/messages/{id}/attachments/{id}` は base64 の `contentBytes` をJSONインラインで返しリダイレクトが発生しないため、追加設定なしでゲートウェイ経由で動く（[mail.md](mail.md) 参照）
+- `ms-graph-cli` の `files get`（ローカルCLI経由、boidサンドボックス外での実行が前提）は素のGoの `http.Client`（既定でリダイレクトを追従する）を使っているため、この制約を受けない（CLI実行環境とboidジョブ実行環境で挙動が異なる点に注意）
+- beta APIには `GET /beta/{drive}/items/{itemId}/contentStream` という、302ではなく**200 + 生バイト列を直接返す**エンドポイントが存在する（`Range` も可）。ゲートウェイをそのまま通せるが、①v1.0未提供のbeta限定でMicrosoftは本番利用を非推奨としている ②サービスの `base_url` が `https://graph.microsoft.com/v1.0` 固定のため beta 用のサービスエントリを別途登録する必要がある、の2点から現状は推奨しない
 
 ## アップロード（シンプルアップロード）
 
@@ -226,8 +254,8 @@ base="$BOID_API_BASE/microsoft-graph-api"
 # 1. ファイルを検索してitem IDを控える
 curl --cacert "$BOID_API_CA_FILE" "$base/me/drive/root/search(q='%E4%BA%88%E7%AE%97')" | jq '.value[] | {id, name}'
 
-# 2. ダウンロード（前述の注意点参照: boidゲートウェイ経由の場合、302の先が既定の許可リストに
-#    含まれず失敗することがある。事前に運用者へ許可リスト設定を確認しておくこと）
+# 2. ダウンロード（前述のダウンロードの節参照: 302の追従先ホスト（例 urbanb-my.sharepoint.com）が
+#    ワークスペースの allowed_domains に登録済みであることが前提。-L で即座に追従すること）
 curl --cacert "$BOID_API_CA_FILE" -L "$base/me/drive/items/{ITEM_ID}/content" -o budget.xlsx
 
 # 3. (ローカルで編集)

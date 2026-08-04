@@ -97,12 +97,14 @@ boidのサンドボックス外（ローカル開発、CI、他システムな�
 - エラー形式はMicrosoft Graph共通のエラーエンベロープ（`{"error": {"code", "message", "innerError": {...}}}`）。Gmailの `error.errors[]`/`error.status` や Bitbucketの `{"type": "error", ...}` とは構造が異なる。詳細は [references/pagination-and-errors.md](references/pagination-and-errors.md)
 - スロットリング（429 Too Many Requests）は `Retry-After` ヘッダー（秒数）付きで返る。Graphはエンドポイント横断の単純な「◯req/分」ではなく、テナント・アプリ・リソースごとの動的な制限であるため、ハードコードした閾値判定はせず429ベースの指数バックオフで対応すること
 
-### ファイルダウンロード（`GET .../content`）の302リダイレクトはboidゲートウェイの守備範囲外になりやすい
+### ファイルダウンロード（`GET .../content`）の302リダイレクトには事前の許可リスト設定が必要
 
-OneDrive/SharePointのファイル本体取得（`GET {drive}/items/{itemId}/content`）は、Graph自身がAzure Blob Storage等の一時的な署名付きURLへ**302リダイレクト**することが多い。boidゲートウェイは素の `httputil.ReverseProxy` で実装されており、**この302を自動フォローせず、生の `Location`（Graphゲートウェイ配下ではない外部の絶対URL）をそのままサンドボックスへ転送する**。一方、boidサンドボックスの外向き通信は既定で許可リスト方式（`sandbox.allowed_domains`）に制限されており、このリダイレクト先ホストは既定では許可リストに含まれない。結果として、boidジョブ内から `-L` 等でリダイレクトを素直に追従しても、ほとんどの場合サンドボックスの送信制限にブロックされて失敗する。これはGmail APIスキルにおける「`users.watch`のインバウンドPub/Sub通知はゲートウェイの守備範囲外」と同種の境界線であり、大きめのファイルを確実にダウンロードする必要がある場合は事前に運用者へ許可リスト設定を確認すること。詳細は [references/files.md](references/files.md) のダウンロードの節を参照。
+OneDrive/SharePointのファイル本体取得（`GET {drive}/items/{itemId}/content`）は、Graph自身が事前認証済み（pre-authenticated）の一時URLへ**302リダイレクト**する。boidゲートウェイは素の `httputil.ReverseProxy` で実装されており、**この302を自動フォローせず、生の `Location`（ゲートウェイ配下ではない外部の絶対URL）をそのままサンドボックスへ転送する**。一方、boidサンドボックスの外向き通信は許可リスト方式（`allowed_domains`）に制限されており、このリダイレクト先ホストは既定では含まれない。結果として、無設定のまま `-L` で追従するとサンドボックスのegressプロキシに `403 domain not allowed` で弾かれる。
+
+**対処は、Graphを使うワークスペースの `allowed_domains` にテナントの具体ホストを追加すること**（`urbanb.sharepoint.com` / `urbanb-my.sharepoint.com` のように完全一致で。`allowed_domains` はグローバル設定への加算なのでワークスペース単位で穴を絞れる）。リダイレクト先URLはトークンがURL自体に埋め込まれているため、サンドボックスが資格情報を持たなくても取得でき、むしろ `Authorization` を転送すると401になる点、URLが数分で失効する点に注意。なおメール添付ファイルの取得（`contentBytes`）はリダイレクトを伴わないためこの問題の影響を受けない。詳細は [references/files.md](references/files.md) のダウンロードの節を参照。
 
 ## `msgraph` CLIのデフォルトアプリ登録について（重要な前提）
 
 `ms-graph-cli` はMicrosoft Entra ID（旧Azure AD）に事前登録された組み込みのクライアントID・テナント（既定 `common`）を使い、認可コードフロー（PKCE）またはデバイスコードフローでユーザー本人のトークンを取得する。**CLIが明示的にリクエストするスコープは `User.Read` と `offline_access` のみ**だが、実際にはメール・カレンダー・ファイル・Teams・To Doの読み書きが行えている。これは当該アプリ登録側（Entra ID管理者が設定）に必要な委任アクセス許可が事前に構成・同意済みであるためで、CLIのコード上の `DefaultScopes` だけを見て「User.Readだけで全部呼べる」と早合点しないこと。自前でアプリ登録から新規に組む場合は、操作したいリソースに応じた委任アクセス許可（`Mail.ReadWrite`, `Files.ReadWrite.All`, `Calendars.ReadWrite`, `ChannelMessage.Send`, `Tasks.ReadWrite` 等）を明示的にリクエスト・同意させる必要がある。詳細は [references/authentication.md](references/authentication.md) のスコープ表を参照。
 
-- 本ドキュメントの内容は公開仕様（`https://learn.microsoft.com/en-us/graph/api/overview`）および `ms-graph-cli` リポジトリ（`cmd/msgraph/*.go`, `internal/client/graph.go`, `internal/config/config.go`）、boid リポジトリ（`internal/apigateway`, `docs/plans/api-gateway.md`, `docs/ja/reference/config-yaml.md`）の調査に基づく記載。Graph API側の仕様変更や、運用者ごとの `config.yaml` のサービス名・認証設定のカスタマイズにより実際の挙動と差異が出ることがある。重要な実装の前には実際のレスポンス・実際の `config.yaml` で仕様を確認すること
+- 本ドキュメントの内容は公開仕様（`https://learn.microsoft.com/en-us/graph/api/overview`）および `ms-graph-cli` リポジトリ（`cmd/msgraph/*.go`, `internal/client/graph.go`, `internal/config/config.go`）、boid リポジトリ（`internal/apigateway`, `internal/sandbox/proxy.go`, `internal/orchestrator/workspace_meta.go`, `docs/plans/api-gateway.md`, `docs/ja/reference/config-yaml.md`）の調査に基づく記載。Graph API側の仕様変更や、運用者ごとの `config.yaml` のサービス名・認証設定のカスタマイズにより実際の挙動と差異が出ることがある。重要な実装の前には実際のレスポンス・実際の `config.yaml` で仕様を確認すること
