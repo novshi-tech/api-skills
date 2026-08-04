@@ -24,17 +24,25 @@ curl --cacert "$BOID_API_CA_FILE" \
 運用者は boid デーモンの `config.yaml` に次のようなサービス定義を置く（`api-skills` リポジトリの `.boid/project.yaml` ではなく、boid デーモン自体の設定に置く点に注意。project.yaml はリポジトリ由来の信頼境界のため、credential にアクセスできる設定はここには置かない設計になっている）:
 
 ```yaml
+oauth_providers:
+  google:
+    token_endpoint: https://oauth2.googleapis.com/token
+    client_id: <Google OAuth clientのclient_id>
+    client_secret_key: google_oauth_client_secret   # secret store参照（confidential clientのみ）
+    scopes: [https://www.googleapis.com/auth/gmail.modify]
+    flow: loopback                                   # Googleはloopback（PKCE + ローカルリスナー）
+    authorization_endpoint: https://accounts.google.com/o/oauth2/v2/auth
+
 services:
   gmail-api:
     base_url: https://gmail.googleapis.com
-    auth:
-      kind: oauth2
-      secret_key: GMAIL_OAUTH_TOKEN
+    auth: { kind: oauth2, provider: google }
 ```
 
-- `auth.kind` は `bearer` / `basic` / `header` / `query` / `oauth2` から選べるが、Gmail APIの慣例は `oauth2`（Google OAuth 2.0のアクセストークンをBearerとして注入し、必要に応じてrefresh tokenでの自動更新もゲートウェイ側が担う想定）。サービスアカウント + ドメイン全体委任（domain-wide delegation）で運用している場合は `secret_key` にサービスアカウント鍵やそこから生成した短命トークンを指すキー名を設定する構成もありうる
-- `secret_key` はboidのシークレットストア上のキー名（例: `GMAIL_OAUTH_TOKEN`）で、実際のトークン値・クライアントシークレットは `config.yaml` に平文で書かない
-- 資格情報の解決・注入に失敗した場合、ゲートウェイは認証情報なしで転送せず502を返す（fail-closed）
+- `auth.kind` は `bearer` / `basic` / `header` / `query` / `oauth2` から選べるが、Gmail APIの慣例は `oauth2`。**`kind: oauth2` は `secret_key` ではなく `provider` を必須とし、`oauth_providers.<name>` エントリを参照する**（`secret_key` は `bearer`/`basic`/`header`/`query` のみで意味を持つフィールドで、`oauth2` では使われない。boidデーモンの設定バリデータは `auth.kind: oauth2` に `provider` が無い場合ロード時エラーにする）
+- `oauth_providers.<name>` 側は `token_endpoint`（必須）/ `client_id`（必須。secretではないため平文でよい）/ `client_secret_key`（confidential clientのみ。secret storeへの参照キー）/ `scopes` / `flow`（`device`/`loopback`/`manual`。`boid secret oauth login <service>` が使う初回認証フロー）/ `authorization_endpoint`（`flow: loopback`/`manual` で必須）を持つ。GoogleはブラウザでのPKCE同意フローが基本のため `flow: loopback` が自然な選択になる。サービスアカウント + ドメイン全体委任（domain-wide delegation）で運用している場合は、この `oauth_providers` の仕組みとは別に、サービスアカウント鍵やそこから生成した短命トークンをsecret store経由で直接注入する構成（`auth.kind: bearer` + `secret_key`）を使うことになる
+- 実際のリフレッシュトークン・アクセストークンの値は `oauth_providers.*` にもここには書かない。`boid secret oauth login <service>`（`flow` 設定時）または `boid secret set` で別途secret storeに投入する。`client_secret_key` を設定した場合もキー名のみで、実値は同様にsecret store経由
+- 資格情報の解決・注入に失敗した場合、ゲートウェイは認証情報なしで転送せず502を返す（fail-closed）。`provider` が指す `oauth_providers` エントリ自体が存在しない場合も、config load時点ではクロスチェックされず、リクエスト時に502（`apigateway: oauth2 provider "..." is not configured`）になる
 - ゲートウェイは他にも401（job token自体が無効・期限切れ）、403（サービスが未有効化 or read-only jobでの書き込み試行）、404（パス不正）、503（シークレットストア未接続）を返しうる。これらはGmail自体のエラーではなくゲートウェイが生成したもので、レスポンスボディもGoogleのJSON形式ではなくプレーンテキスト。ステータスごとの切り分けは [pagination-and-errors.md](pagination-and-errors.md) の一覧を参照
 
 ### サービス名は固定ではない

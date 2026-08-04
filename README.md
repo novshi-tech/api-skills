@@ -4,7 +4,5 @@
 
 ## 開発予定
 
-- Bitbucket
-- Microsoft Graph
 - Freee
 - board
