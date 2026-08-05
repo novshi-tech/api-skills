@@ -4,5 +4,4 @@
 
 ## 開発予定
 
-- Freee
 - board
